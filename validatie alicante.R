@@ -565,19 +565,6 @@ score_model <- function(model_name, mod, test_df) {
   )
 }
 
-score_fourier <- function(model_name, fit_obj, test_df, K, period = 365.25) {
-  test_df2 <- add_fourier_terms(test_df, K = K, period = period, prefix = "harm")
-  p <- predict(fit_obj$model, newdata = test_df2, type = "response")
-  data.frame(
-    model  = model_name,
-    n_test = nrow(test_df2),
-    brier  = brier(test_df2$exc, p),
-    logloss= logloss(test_df2$exc, p),
-    auc    = safe_auc(test_df2$exc, p),
-    stringsAsFactors = FALSE
-  )
-}
-
 val_rows <- list()
 
 # Base comparison set: full test (baseline-only models)
@@ -591,17 +578,6 @@ val_rows$baseline_GCV  <- score_model("baseline_GCV",  m_base_gcv,  test0)
 val_rows$baseline_REML_kbig <- score_model("baseline_REML_kbig", m_base_kbig, test0)
 val_rows$baseline_doyTP <- score_model("baseline_doyTP", m_base_doy_tp, test0)
 val_rows$baseline_timeCR <- score_model("baseline_timeCR", m_base_time_cr, test0)
-for (i in seq_along(FOURIER_K)) {
-  K <- FOURIER_K[[i]]
-  model_name <- paste0("baseline_fourier_K", K)
-  val_rows[[model_name]] <- score_fourier(
-    model_name = model_name,
-    fit_obj = fourier_fits[[i]],
-    test_df = test0,
-    K = K,
-    period = 365.25
-  )
-}
 
 # Lag comparison set: lag-capable models (needs lag1)
 val_rows$lag_REML <- score_model("lag_REML", m_lag_reml, test_lag)
@@ -613,19 +589,7 @@ if (nrow(test_nao) > 0) {
   test_nao_lag <- bind_rows(train_lag_nao, test_nao) %>%
     add_lag1() %>%
     filter(DATE > TRAIN_END)
-
-  for (i in seq_along(FOURIER_K)) {
-    K <- FOURIER_K[[i]]
-    model_name <- paste0("baseline_fourier_K", K, "_NAOsubset")
-    val_rows[[model_name]] <- score_fourier(
-      model_name = model_name,
-      fit_obj = fourier_fits[[i]],
-      test_df = test_nao,
-      K = K,
-      period = 365.25
-    )
-  }
-
+  
   p_clim_nao <- rep(p_clim_full, nrow(test_nao))
   val_rows$climatology_NAOsubset <- data.frame(model="climatology_NAOsubset",
                                                n_test=nrow(test_nao),
@@ -764,6 +728,48 @@ writeLines(
 cat("\nDONE. All outputs in:\n", OUT_DIR, "\n")
 
 
+# gam check
+library(mgcv)
+
+m_lowk <- gam(
+  exc ~ s(time, k = 15) + s(doy, bs = "cc", k = 10),
+  family = binomial(link = "logit"),
+  data = train0,
+  method = "REML",
+  knots = KNOTS_DOY
+)
+
+png(file.path(OUT_DIR, "gamcheck_lowk.png"), width = 1600, height = 1100, res = 150)
+gam.check(m_lowk)
+dev.off()
+
+k.check(m_lowk)
+
+m_highk <- gam(
+  exc ~ s(time, k = t_base$final_k$k_time) + s(doy, bs = "cc", k = t_base$final_k$k_doy),
+  family = binomial(link = "logit"),
+  data = train0,
+  method = "REML",
+  knots = KNOTS_DOY
+)
+
+png(file.path(OUT_DIR, "gamcheck_highk.png"), width = 1600, height = 1100, res = 150)
+gam.check(m_highk)
+dev.off()
+
+k.check(m_highk)
+
+
+gam.check(m_lag_reml)
+k.check(m_lag_reml)
+
+gam.check(m_lag_nao_reml)
+k.check(m_lag_nao_reml)
+
+
+
+
+# 3 folds
 # ============================================================
 # 14) 3-FOLD TIME-BLOCKED CV (same specs) — scores + optional calibration
 # ============================================================
