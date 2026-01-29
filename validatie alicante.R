@@ -578,12 +578,6 @@ val_rows$baseline_GCV  <- score_model("baseline_GCV",  m_base_gcv,  test0)
 val_rows$baseline_REML_kbig <- score_model("baseline_REML_kbig", m_base_kbig, test0)
 val_rows$baseline_doyTP <- score_model("baseline_doyTP", m_base_doy_tp, test0)
 val_rows$baseline_timeCR <- score_model("baseline_timeCR", m_base_time_cr, test0)
-for (i in seq_along(FOURIER_K)) {
-  K <- FOURIER_K[[i]]
-  model_name <- paste0("baseline_fourier_K", K)
-  test_fourier <- add_fourier_terms(test0, K = K, period = 365.25, prefix = "harm")
-  val_rows[[model_name]] <- score_model(model_name, fourier_fits[[i]]$model, test_fourier)
-}
 
 # Lag comparison set: lag-capable models (needs lag1)
 val_rows$lag_REML <- score_model("lag_REML", m_lag_reml, test_lag)
@@ -734,6 +728,48 @@ writeLines(
 cat("\nDONE. All outputs in:\n", OUT_DIR, "\n")
 
 
+# gam check
+library(mgcv)
+
+m_lowk <- gam(
+  exc ~ s(time, k = 15) + s(doy, bs = "cc", k = 10),
+  family = binomial(link = "logit"),
+  data = train0,
+  method = "REML",
+  knots = KNOTS_DOY
+)
+
+png(file.path(OUT_DIR, "gamcheck_lowk.png"), width = 1600, height = 1100, res = 150)
+gam.check(m_lowk)
+dev.off()
+
+k.check(m_lowk)
+
+m_highk <- gam(
+  exc ~ s(time, k = t_base$final_k$k_time) + s(doy, bs = "cc", k = t_base$final_k$k_doy),
+  family = binomial(link = "logit"),
+  data = train0,
+  method = "REML",
+  knots = KNOTS_DOY
+)
+
+png(file.path(OUT_DIR, "gamcheck_highk.png"), width = 1600, height = 1100, res = 150)
+gam.check(m_highk)
+dev.off()
+
+k.check(m_highk)
+
+
+gam.check(m_lag_reml)
+k.check(m_lag_reml)
+
+gam.check(m_lag_nao_reml)
+k.check(m_lag_nao_reml)
+
+
+
+
+# 3 folds
 # ============================================================
 # 14) 3-FOLD TIME-BLOCKED CV (same specs) — scores + optional calibration
 # ============================================================
