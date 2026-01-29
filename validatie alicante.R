@@ -282,11 +282,25 @@ df_full <- bind_rows(train0, test0) %>% arrange(DATE) %>% add_time_vars()
 df_ref  <- df_full
 
 train_lag <- add_lag1(train0)
-test_lag  <- add_lag1(test0)
+# For lag1 in test, use last train day to avoid dropping first test day
+test_lag <- bind_rows(train0, test0) %>%
+  add_lag1() %>%
+  filter(DATE > TRAIN_END)
 
 nao_daily <- read_nao_daily(NAO_FILE)
 train_lag_nao <- train_lag %>% left_join(nao_daily, by="DATE") %>% filter(!is.na(nao))
 test_lag_nao  <- test_lag  %>% left_join(nao_daily, by="DATE") %>% filter(!is.na(nao))
+standardize_nao_main <- function(train_df, test_df) {
+  mu <- mean(train_df$nao, na.rm=TRUE)
+  sdv <- sd(train_df$nao, na.rm=TRUE)
+  if (is.na(sdv) || sdv == 0) sdv <- 1
+  train_df$nao <- (train_df$nao - mu) / sdv
+  test_df$nao  <- (test_df$nao  - mu) / sdv
+  list(train=train_df, test=test_df)
+}
+nao_std <- standardize_nao_main(train_lag_nao, test_lag_nao)
+train_lag_nao <- nao_std$train
+test_lag_nao  <- nao_std$test
 
 cat("Station:", STATION_NAME, "\n")
 cat("Train rows:", nrow(train0), " Test rows:", nrow(test0), "\n")
@@ -302,6 +316,31 @@ fit_baseline <- function(train_df, k_time, k_doy, bs_time="tp", bs_doy="cc", met
       data=train_df, family=binomial("logit"),
       method=method,
       knots=if (bs_doy=="cc") KNOTS_DOY else NULL)
+}
+
+add_fourier_terms <- function(dat, K, period = 365.25, prefix = "harm") {
+  if (K < 1) stop("K must be >= 1 for Fourier terms")
+  out <- dat
+  for (j in seq_len(K)) {
+    ang <- 2 * pi * j * out$doy / period
+    out[[paste0(prefix, "_sin", j)]] <- sin(ang)
+    out[[paste0(prefix, "_cos", j)]] <- cos(ang)
+  }
+  out
+}
+
+fit_fourier <- function(train_df, K, k_time, period = 365.25, method = "REML") {
+  train_df <- add_fourier_terms(train_df, K = K, period = period, prefix = "harm")
+  seasonal_terms <- as.vector(rbind(
+    paste0("harm_sin", seq_len(K)),
+    paste0("harm_cos", seq_len(K))
+  ))
+  rhs <- c(sprintf("s(time, k = %d)", k_time), seasonal_terms)
+  form <- as.formula(paste("exc ~", paste(rhs, collapse = " + ")))
+  mod <- gam(form,
+             data=train_df, family=binomial("logit"),
+             method=method)
+  list(model = mod, data = train_df)
 }
 
 fit_lag <- function(train_df, k_time, k_doy, bs_time="tp", bs_doy="cc", method="REML") {
@@ -384,6 +423,10 @@ t_base <- auto_tune_k_time_doy(
   max_iter=MAX_K_ITER, p_cut=KCHECK_P_CUT, kindex_cut=KCHECK_KI_CUT
 )
 m_base_reml <- t_base$final_model
+FOURIER_K <- 1:4
+fourier_fits <- lapply(FOURIER_K, function(K) {
+  fit_fourier(train0, K = K, k_time = t_base$final_k$k_time, period = 365.25, method = "REML")
+})
 
 # Diagnostics: baseline
 save_gamcheck_png(m_base_reml, file.path(OUT_DIR, "gamcheck_baseline_REML.png"))
@@ -522,66 +565,126 @@ score_model <- function(model_name, mod, test_df) {
   )
 }
 
-val_rows <- list()
-
-# Comparable: baseline-type specs use test0; lag specs use test_lag; nao specs use test_lag_nao
-val_rows$climatology <- {
-  p_clim <- mean(train0$exc)
-  data.frame(model="climatology", n_test=nrow(test0),
-             brier=brier(test0$exc, rep(p_clim, nrow(test0))),
-             logloss=logloss(test0$exc, rep(p_clim, nrow(test0))),
-             auc=safe_auc(test0$exc, rep(p_clim, nrow(test0))))
+score_fourier <- function(model_name, fit_obj, test_df, K, period = 365.25) {
+  test_df2 <- add_fourier_terms(test_df, K = K, period = period, prefix = "harm")
+  p <- predict(fit_obj$model, newdata = test_df2, type = "response")
+  data.frame(
+    model  = model_name,
+    n_test = nrow(test_df2),
+    brier  = brier(test_df2$exc, p),
+    logloss= logloss(test_df2$exc, p),
+    auc    = safe_auc(test_df2$exc, p),
+    stringsAsFactors = FALSE
+  )
 }
 
+val_rows <- list()
+
+# Base comparison set: full test (baseline-only models)
+p_clim_full <- mean(train0$exc)
+val_rows$climatology_full <- data.frame(model="climatology_full", n_test=nrow(test0),
+                                        brier=brier(test0$exc, rep(p_clim_full, nrow(test0))),
+                                        logloss=logloss(test0$exc, rep(p_clim_full, nrow(test0))),
+                                        auc=safe_auc(test0$exc, rep(p_clim_full, nrow(test0))))
 val_rows$baseline_REML <- score_model("baseline_REML", m_base_reml, test0)
 val_rows$baseline_GCV  <- score_model("baseline_GCV",  m_base_gcv,  test0)
 val_rows$baseline_REML_kbig <- score_model("baseline_REML_kbig", m_base_kbig, test0)
 val_rows$baseline_doyTP <- score_model("baseline_doyTP", m_base_doy_tp, test0)
 val_rows$baseline_timeCR <- score_model("baseline_timeCR", m_base_time_cr, test0)
+for (i in seq_along(FOURIER_K)) {
+  K <- FOURIER_K[[i]]
+  model_name <- paste0("baseline_fourier_K", K)
+  val_rows[[model_name]] <- score_fourier(
+    model_name = model_name,
+    fit_obj = fourier_fits[[i]],
+    test_df = test0,
+    K = K,
+    period = 365.25
+  )
+}
 
+# Lag comparison set: lag-capable models (needs lag1)
 val_rows$lag_REML <- score_model("lag_REML", m_lag_reml, test_lag)
-val_rows$lag_nao_REML <- score_model("lag_nao_REML", m_lag_nao_reml, test_lag_nao)
-val_rows$int_REML <- score_model("int_REML", m_int_reml, test_lag_nao)
-val_rows$lag_nao_BAM_AR1 <- score_model("lag_nao_BAM_AR1", m_lag_nao_bam, test_lag_nao)
 
-val_table <- bind_rows(val_rows) %>%
-  arrange(logloss, brier, desc(auc))
+# NAO comparison set: all models evaluated on NAO subset for fair ranking
+test_nao <- test0 %>% left_join(nao_daily, by="DATE") %>% filter(!is.na(nao))
+if (nrow(test_nao) > 0) {
+  test_nao <- standardize_nao_main(train_lag_nao, test_nao)$test
+  test_nao_lag <- bind_rows(train_lag_nao, test_nao) %>%
+    add_lag1() %>%
+    filter(DATE > TRAIN_END)
 
+  for (i in seq_along(FOURIER_K)) {
+    K <- FOURIER_K[[i]]
+    model_name <- paste0("baseline_fourier_K", K, "_NAOsubset")
+    val_rows[[model_name]] <- score_fourier(
+      model_name = model_name,
+      fit_obj = fourier_fits[[i]],
+      test_df = test_nao,
+      K = K,
+      period = 365.25
+    )
+  }
+
+  p_clim_nao <- rep(p_clim_full, nrow(test_nao))
+  val_rows$climatology_NAOsubset <- data.frame(model="climatology_NAOsubset",
+                                               n_test=nrow(test_nao),
+                                               brier=brier(test_nao$exc, p_clim_nao),
+                                               logloss=logloss(test_nao$exc, p_clim_nao),
+                                               auc=safe_auc(test_nao$exc, p_clim_nao))
+  val_rows$baseline_REML_NAOsubset <- score_model("baseline_REML_NAOsubset", m_base_reml, test_nao)
+  val_rows$lag_REML_NAOsubset <- score_model("lag_REML_NAOsubset", m_lag_reml, test_nao_lag)
+  val_rows$lag_nao_REML <- score_model("lag_nao_REML", m_lag_nao_reml, test_lag_nao)
+  val_rows$int_REML <- score_model("int_REML", m_int_reml, test_lag_nao)
+  val_rows$lag_nao_BAM_AR1 <- score_model("lag_nao_BAM_AR1", m_lag_nao_bam, test_lag_nao)
+}
+
+val_table <- bind_rows(val_rows)
 write.csv(val_table, file.path(OUT_DIR, "validation_scores_ALL.csv"), row.names=FALSE)
 cat("\nSaved:", file.path(OUT_DIR, "validation_scores_ALL.csv"), "\n")
 print(val_table)
 
-# Calibration plots for top-3 by LogLoss (and climatology)
-top3 <- head(val_table$model, 3)
-for (mname in unique(c("climatology", top3))) {
-  if (mname == "climatology") {
-    p <- rep(mean(train0$exc), nrow(test0))
-    plot_calibration(test0$exc, p,
-                     title=paste0(STATION_NAME, " — ", mname, " calibration (TEST)"),
-                     out_png=file.path(OUT_DIR, paste0("calibration_", mname, ".png")))
-  } else if (mname %in% c("baseline_REML","baseline_GCV","baseline_REML_kbig","baseline_doyTP","baseline_timeCR")) {
-    mod <- get(mname, inherits=TRUE)
-    p <- predict(mod, newdata=test0, type="response")
-    plot_calibration(test0$exc, p,
-                     title=paste0(STATION_NAME, " — ", mname, " calibration (TEST)"),
-                     out_png=file.path(OUT_DIR, paste0("calibration_", mname, ".png")))
-  } else if (mname %in% c("lag_REML")) {
-    p <- predict(m_lag_reml, newdata=test_lag, type="response")
-    plot_calibration(test_lag$exc, p,
-                     title=paste0(STATION_NAME, " — ", mname, " calibration (TEST)"),
-                     out_png=file.path(OUT_DIR, paste0("calibration_", mname, ".png")))
-  } else {
-    # lag+nao / int / bam: use test_lag_nao
-    mod <- switch(mname,
-                  "lag_nao_REML" = m_lag_nao_reml,
-                  "int_REML" = m_int_reml,
-                  "lag_nao_BAM_AR1" = m_lag_nao_bam,
-                  NULL)
-    if (!is.null(mod)) {
-      p <- predict(mod, newdata=test_lag_nao, type="response")
-      plot_calibration(test_lag_nao$exc, p,
-                       title=paste0(STATION_NAME, " — ", mname, " calibration (TEST)"),
+# Fair ranking (NAO subset only)
+val_rank <- val_table %>%
+  filter(grepl("NAOsubset|lag_nao|int_REML", model)) %>%
+  arrange(logloss, brier, desc(auc))
+write.csv(val_rank, file.path(OUT_DIR, "validation_scores_NAOsubset_ranked.csv"), row.names=FALSE)
+cat("\nSaved:", file.path(OUT_DIR, "validation_scores_NAOsubset_ranked.csv"), "\n")
+
+# Calibration plots for top-3 by LogLoss on NAO subset + baseline climatology
+top3_nao <- head(val_rank$model, 3)
+if (exists("test_nao") && nrow(test_nao) > 0) {
+  for (mname in unique(c("climatology_full", top3_nao))) {
+    if (mname == "climatology_full") {
+      p <- rep(mean(train0$exc), nrow(test0))
+      plot_calibration(test0$exc, p,
+                       title=paste0(STATION_NAME, " — climatology (TEST full)"),
+                       out_png=file.path(OUT_DIR, "calibration_climatology_full.png"))
+    } else if (mname %in% c("baseline_REML","baseline_GCV","baseline_REML_kbig","baseline_doyTP","baseline_timeCR",
+                            "baseline_REML_NAOsubset")) {
+      mod <- if (mname == "baseline_REML_NAOsubset") m_base_reml else get(mname, inherits=TRUE)
+      p <- predict(mod, newdata=test_nao, type="response")
+      plot_calibration(test_nao$exc, p,
+                       title=paste0(STATION_NAME, " — ", mname, " calibration (TEST NAO subset)"),
                        out_png=file.path(OUT_DIR, paste0("calibration_", mname, ".png")))
+    } else if (mname %in% c("lag_REML_NAOsubset")) {
+      p <- predict(m_lag_reml, newdata=test_nao_lag, type="response")
+      plot_calibration(test_nao_lag$exc, p,
+                       title=paste0(STATION_NAME, " — ", mname, " calibration (TEST NAO subset)"),
+                       out_png=file.path(OUT_DIR, paste0("calibration_", mname, ".png")))
+    } else {
+      # lag+nao / int / bam: use test_lag_nao
+      mod <- switch(mname,
+                    "lag_nao_REML" = m_lag_nao_reml,
+                    "int_REML" = m_int_reml,
+                    "lag_nao_BAM_AR1" = m_lag_nao_bam,
+                    NULL)
+      if (!is.null(mod)) {
+        p <- predict(mod, newdata=test_lag_nao, type="response")
+        plot_calibration(test_lag_nao$exc, p,
+                         title=paste0(STATION_NAME, " — ", mname, " calibration (TEST NAO subset)"),
+                         out_png=file.path(OUT_DIR, paste0("calibration_", mname, ".png")))
+      }
     }
   }
 }
@@ -623,12 +726,19 @@ capture.output(concurvity(m_int_reml, full=TRUE),
                file=file.path(OUT_DIR, "concurvity_int_REML.txt"))
 
 # ----------------------------
-# 13) Final "best model" selection + write report
+# 13) Final "best model" selection + write report (NAO subset ranking)
 # ----------------------------
-best <- val_table %>% slice(1)
-best_name <- best$model[1]
+if (nrow(val_rank) == 0) {
+  best <- val_table %>% slice(1)
+  best_name <- best$model[1]
+  selection_note <- "Selection rule (full test): minimize LogLoss; tie-breaker Brier; then maximize AUC."
+} else {
+  best <- val_rank %>% slice(1)
+  best_name <- best$model[1]
+  selection_note <- "Selection rule (NAO subset): minimize LogLoss; tie-breaker Brier; then maximize AUC."
+}
 
-cat("\nBEST (by LogLoss then Brier then AUC):\n")
+cat("\nBEST on NAO subset (by LogLoss then Brier then AUC):\n")
 print(best)
 
 writeLines(
@@ -637,7 +747,7 @@ writeLines(
     paste0("Train end: ", TRAIN_END),
     paste0("Threshold (train): ", round(thr_train,2), " mm (wet-day p=", P_EXTREME, ")"),
     "",
-    "Selection rule: minimize LogLoss; tie-breaker Brier; then maximize AUC.",
+    selection_note,
     paste0("Best model: ", best_name),
     paste0("Scores (TEST): logloss=", round(best$logloss,6),
            "  brier=", round(best$brier,6),
@@ -654,48 +764,6 @@ writeLines(
 cat("\nDONE. All outputs in:\n", OUT_DIR, "\n")
 
 
-# gam check
-library(mgcv)
-
-m_lowk <- gam(
-  exc ~ s(time, k = 15) + s(doy, bs = "cc", k = 10),
-  family = binomial(link = "logit"),
-  data = train0,
-  method = "REML",
-  knots = KNOTS_DOY
-)
-
-png(file.path(OUT_DIR, "gamcheck_lowk.png"), width = 1600, height = 1100, res = 150)
-gam.check(m_lowk)
-dev.off()
-
-k.check(m_lowk)
-
-m_highk <- gam(
-  exc ~ s(time, k = t_base$final_k$k_time) + s(doy, bs = "cc", k = t_base$final_k$k_doy),
-  family = binomial(link = "logit"),
-  data = train0,
-  method = "REML",
-  knots = KNOTS_DOY
-)
-
-png(file.path(OUT_DIR, "gamcheck_highk.png"), width = 1600, height = 1100, res = 150)
-gam.check(m_highk)
-dev.off()
-
-k.check(m_highk)
-
-
-gam.check(m_lag_reml)
-k.check(m_lag_reml)
-
-gam.check(m_lag_nao_reml)
-k.check(m_lag_nao_reml)
-
-
-
-
-# 3 folds
 # ============================================================
 # 14) 3-FOLD TIME-BLOCKED CV (same specs) — scores + optional calibration
 # ============================================================
@@ -709,6 +777,7 @@ FOLDS <- list(
        test_start=as.Date("2011-01-01"), test_end=as.Date("2020-12-31"))
 )
 
+RUN_3FOLD_CV <- FALSE            # zet TRUE als je de langzame 3-fold CV wilt draaien
 SAVE_FOLD_CALIBRATION <- TRUE     # zet FALSE als je geen extra plots wilt
 CALIBRATION_BINS <- 10
 CAL_X_MAX <- 0.015                # zoom x-as (anders wordt alles smal)
@@ -783,8 +852,10 @@ score_df <- function(model_name, fold_name, thr, y, p) {
 }
 
 cv_scores <- list()
+cv_preds <- list()
 
-for (sp in FOLDS) {
+if (RUN_3FOLD_CV) {
+  for (sp in FOLDS) {
   
   cat("\n--- Running", sp$name, "train_end =", as.character(sp$train_end),
       "test =", as.character(sp$test_start), "to", as.character(sp$test_end), "\n")
@@ -877,61 +948,54 @@ for (sp in FOLDS) {
                             out_png=file.path(cal_dir, "cal_int_REML.png"))
     }
     
+    cv_preds[[length(cv_preds)+1]] <- data.frame(
+      fold = sp$name,
+      model = "lag_nao_REML",
+      y = test_nao_l$exc,
+      p = p_lagnao
+    )
+    
   } else {
     cat("  (Skipping NAO models in", sp$name, "- insufficient NAO overlap or too few events.)\n")
   }
+  }
+  
+  cv_table <- bind_rows(cv_scores)
+  
+  write.csv(cv_table, file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), row.names=FALSE)
+  cat("\nSaved 3-fold CV scores to:", file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), "\n")
+  
+  # ---- mean over folds per model (overall) ----
+  cv_mean <- cv_table %>%
+    group_by(model) %>%
+    summarise(
+      mean_logloss = mean(logloss, na.rm=TRUE),
+      mean_brier   = mean(brier, na.rm=TRUE),
+      mean_auc     = mean(auc, na.rm=TRUE),
+      n_folds      = n_distinct(fold),
+      .groups="drop"
+    ) %>%
+    arrange(mean_logloss, mean_brier, desc(mean_auc))
+  
+  write.csv(cv_mean, file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), row.names=FALSE)
+  cat("Saved 3-fold mean scores to:", file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), "\n")
+  
+  print(cv_mean)
+  
+  preds_df <- dplyr::bind_rows(cv_preds)
+  
+  if (nrow(preds_df) > 0) {
+    df_lagnao <- preds_df %>%
+      filter(model == "lag_nao_REML")
+    
+    plot_calibration_zoom(
+      y = df_lagnao$y,
+      p = df_lagnao$p,
+      title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
+      out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
+    )
+  }
+} else {
+  cat("\nSkipping 3-fold CV. Set RUN_3FOLD_CV <- TRUE to enable.\n")
 }
-
-cv_table <- bind_rows(cv_scores)
-
-write.csv(cv_table, file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), row.names=FALSE)
-cat("\nSaved 3-fold CV scores to:", file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), "\n")
-
-# ---- mean over folds per model (overall) ----
-cv_mean <- cv_table %>%
-  group_by(model) %>%
-  summarise(
-    mean_logloss = mean(logloss, na.rm=TRUE),
-    mean_brier   = mean(brier, na.rm=TRUE),
-    mean_auc     = mean(auc, na.rm=TRUE),
-    n_folds      = n_distinct(fold),
-    .groups="drop"
-  ) %>%
-  arrange(mean_logloss, mean_brier, desc(mean_auc))
-
-write.csv(cv_mean, file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), row.names=FALSE)
-cat("Saved 3-fold mean scores to:", file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), "\n")
-
-print(cv_mean)
-
-
-data.frame(
-  fold = sp$name,
-  model = "lag_nao_REML",
-  y = test_nao_l$exc,
-  p = p_lagnao
-)
-
-cv_preds <- list()
-
-cv_preds[[length(cv_preds)+1]] <- data.frame(
-  fold = sp$name,
-  model = "lag_nao_REML",
-  y = test_nao_l$exc,
-  p = p_lagnao
-)
-
-preds_df <- dplyr::bind_rows(cv_preds)
-
-df_lagnao <- preds_df %>%
-  filter(model == "lag_nao_REML")
-
-plot_calibration_zoom(
-  y = df_lagnao$y,
-  p = df_lagnao$p,
-  title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
-  out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
-)
-
-
 
