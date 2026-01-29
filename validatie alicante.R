@@ -318,6 +318,31 @@ fit_baseline <- function(train_df, k_time, k_doy, bs_time="tp", bs_doy="cc", met
       knots=if (bs_doy=="cc") KNOTS_DOY else NULL)
 }
 
+add_fourier_terms <- function(dat, K, period = 365.25, prefix = "harm") {
+  if (K < 1) stop("K must be >= 1 for Fourier terms")
+  out <- dat
+  for (j in seq_len(K)) {
+    ang <- 2 * pi * j * out$doy / period
+    out[[paste0(prefix, "_sin", j)]] <- sin(ang)
+    out[[paste0(prefix, "_cos", j)]] <- cos(ang)
+  }
+  out
+}
+
+fit_fourier <- function(train_df, K, k_time, period = 365.25, method = "REML") {
+  train_df <- add_fourier_terms(train_df, K = K, period = period, prefix = "harm")
+  seasonal_terms <- as.vector(rbind(
+    paste0("harm_sin", seq_len(K)),
+    paste0("harm_cos", seq_len(K))
+  ))
+  rhs <- c(sprintf("s(time, k = %d)", k_time), seasonal_terms)
+  form <- as.formula(paste("exc ~", paste(rhs, collapse = " + ")))
+  mod <- gam(form,
+             data=train_df, family=binomial("logit"),
+             method=method)
+  list(model = mod, data = train_df)
+}
+
 fit_lag <- function(train_df, k_time, k_doy, bs_time="tp", bs_doy="cc", method="REML") {
   gam(exc ~ s(time, bs=bs_time, k=k_time) + s(doy, bs=bs_doy, k=k_doy) + lag1,
       data=train_df, family=binomial("logit"),
@@ -398,6 +423,10 @@ t_base <- auto_tune_k_time_doy(
   max_iter=MAX_K_ITER, p_cut=KCHECK_P_CUT, kindex_cut=KCHECK_KI_CUT
 )
 m_base_reml <- t_base$final_model
+FOURIER_K <- 1:4
+fourier_fits <- lapply(FOURIER_K, function(K) {
+  fit_fourier(train0, K = K, k_time = t_base$final_k$k_time, period = 365.25, method = "REML")
+})
 
 # Diagnostics: baseline
 save_gamcheck_png(m_base_reml, file.path(OUT_DIR, "gamcheck_baseline_REML.png"))
@@ -754,6 +783,7 @@ FOLDS <- list(
        test_start=as.Date("2011-01-01"), test_end=as.Date("2020-12-31"))
 )
 
+RUN_3FOLD_CV <- FALSE            # zet TRUE als je de langzame 3-fold CV wilt draaien
 SAVE_FOLD_CALIBRATION <- TRUE     # zet FALSE als je geen extra plots wilt
 CALIBRATION_BINS <- 10
 CAL_X_MAX <- 0.015                # zoom x-as (anders wordt alles smal)
@@ -828,8 +858,10 @@ score_df <- function(model_name, fold_name, thr, y, p) {
 }
 
 cv_scores <- list()
+cv_preds <- list()
 
-for (sp in FOLDS) {
+if (RUN_3FOLD_CV) {
+  for (sp in FOLDS) {
   
   cat("\n--- Running", sp$name, "train_end =", as.character(sp$train_end),
       "test =", as.character(sp$test_start), "to", as.character(sp$test_end), "\n")
@@ -922,61 +954,54 @@ for (sp in FOLDS) {
                             out_png=file.path(cal_dir, "cal_int_REML.png"))
     }
     
+    cv_preds[[length(cv_preds)+1]] <- data.frame(
+      fold = sp$name,
+      model = "lag_nao_REML",
+      y = test_nao_l$exc,
+      p = p_lagnao
+    )
+    
   } else {
     cat("  (Skipping NAO models in", sp$name, "- insufficient NAO overlap or too few events.)\n")
   }
+  }
+  
+  cv_table <- bind_rows(cv_scores)
+  
+  write.csv(cv_table, file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), row.names=FALSE)
+  cat("\nSaved 3-fold CV scores to:", file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), "\n")
+  
+  # ---- mean over folds per model (overall) ----
+  cv_mean <- cv_table %>%
+    group_by(model) %>%
+    summarise(
+      mean_logloss = mean(logloss, na.rm=TRUE),
+      mean_brier   = mean(brier, na.rm=TRUE),
+      mean_auc     = mean(auc, na.rm=TRUE),
+      n_folds      = n_distinct(fold),
+      .groups="drop"
+    ) %>%
+    arrange(mean_logloss, mean_brier, desc(mean_auc))
+  
+  write.csv(cv_mean, file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), row.names=FALSE)
+  cat("Saved 3-fold mean scores to:", file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), "\n")
+  
+  print(cv_mean)
+  
+  preds_df <- dplyr::bind_rows(cv_preds)
+  
+  if (nrow(preds_df) > 0) {
+    df_lagnao <- preds_df %>%
+      filter(model == "lag_nao_REML")
+    
+    plot_calibration_zoom(
+      y = df_lagnao$y,
+      p = df_lagnao$p,
+      title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
+      out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
+    )
+  }
+} else {
+  cat("\nSkipping 3-fold CV. Set RUN_3FOLD_CV <- TRUE to enable.\n")
 }
-
-cv_table <- bind_rows(cv_scores)
-
-write.csv(cv_table, file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), row.names=FALSE)
-cat("\nSaved 3-fold CV scores to:", file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), "\n")
-
-# ---- mean over folds per model (overall) ----
-cv_mean <- cv_table %>%
-  group_by(model) %>%
-  summarise(
-    mean_logloss = mean(logloss, na.rm=TRUE),
-    mean_brier   = mean(brier, na.rm=TRUE),
-    mean_auc     = mean(auc, na.rm=TRUE),
-    n_folds      = n_distinct(fold),
-    .groups="drop"
-  ) %>%
-  arrange(mean_logloss, mean_brier, desc(mean_auc))
-
-write.csv(cv_mean, file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), row.names=FALSE)
-cat("Saved 3-fold mean scores to:", file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), "\n")
-
-print(cv_mean)
-
-
-data.frame(
-  fold = sp$name,
-  model = "lag_nao_REML",
-  y = test_nao_l$exc,
-  p = p_lagnao
-)
-
-cv_preds <- list()
-
-cv_preds[[length(cv_preds)+1]] <- data.frame(
-  fold = sp$name,
-  model = "lag_nao_REML",
-  y = test_nao_l$exc,
-  p = p_lagnao
-)
-
-preds_df <- dplyr::bind_rows(cv_preds)
-
-df_lagnao <- preds_df %>%
-  filter(model == "lag_nao_REML")
-
-plot_calibration_zoom(
-  y = df_lagnao$y,
-  p = df_lagnao$p,
-  title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
-  out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
-)
-
-
 
