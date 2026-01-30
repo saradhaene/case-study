@@ -704,6 +704,18 @@ p_base_overlay <- ggplot(curves_base, aes(x=date, y=fit, linetype=which)) +
 ggsave(file.path(OUT_DIR, "overlay_base_REML_vs_GCV.png"),
        p_base_overlay, width=10, height=5, dpi=150)
 
+curves_base_ci <- curves_base %>%
+  mutate(ribbon_group = which)
+
+p_base_overlay_ci <- ggplot(curves_base_ci, aes(x=date, y=fit, linetype=which)) +
+  geom_ribbon(aes(ymin=lo, ymax=hi, fill=ribbon_group), alpha=0.12, color=NA) +
+  geom_line(linewidth=1) +
+  labs(x=NULL, y="P(exceedance)",
+       title=paste0(STATION_NAME, " — Baseline: REML vs GCV (doy=180, CI)")) +
+  theme_minimal()
+ggsave(file.path(OUT_DIR, "overlay_base_REML_vs_GCV_CI.png"),
+       p_base_overlay_ci, width=10, height=5, dpi=150)
+
 curve_gam <- make_curve_ci(m_lag_nao_reml, df_ref, label="Lag+NAO GAM (REML)")
 curve_bam <- make_curve_ci(m_lag_nao_bam,  df_ref, label=paste0("Lag+NAO BAM AR1 rho=", round(rho_hat,3)))
 curves_gb <- bind_rows(curve_gam, curve_bam)
@@ -997,4 +1009,495 @@ if (RUN_3FOLD_CV) {
   }
 } else {
   cat("\nSkipping 3-fold CV. Set RUN_3FOLD_CV <- TRUE to enable.\n")
+}
+
+# ============================================================
+# 15) JOINT WEEKLY VALIDATION (zoals validatie joint 2)
+# ============================================================
+
+RUN_JOINT_WEEKLY_VALIDATION <- TRUE
+
+if (RUN_JOINT_WEEKLY_VALIDATION) {
+  JOINT_STATIONS <- c(
+    madrid    = "madrid.xlsx",
+    barcelona = "barcelona.xlsx",
+    asturias  = "asturias.xlsx",
+    sevilla   = "sevilla.xlsx",
+    valencia  = "valencia.xlsx",
+    alicante  = "alicante.xlsx",
+    vigo      = "vigo.xlsx"
+  )
+
+  JOINT_P_EXTREME <- 0.85
+  JOINT_K <- 2
+
+  JOINT_SPLITS <- list(
+    list(train_end="1990-12-31", test_start="1991-01-01", test_end="2000-12-31"),
+    list(train_end="2000-12-31", test_start="2001-01-01", test_end="2010-12-31"),
+    list(train_end="2010-12-31", test_start="2011-01-01", test_end="2020-12-31")
+  )
+
+  JOINT_SAVE_PLOTS <- TRUE
+  JOINT_PLOT_FOLD_TO_SAVE <- 3
+
+  JOINT_OUT_DIR <- file.path(DATA_DIR, paste0("outputs_validation_joint_weekly_p", JOINT_P_EXTREME, "_K", JOINT_K))
+  dir.create(JOINT_OUT_DIR, showWarnings = FALSE)
+
+  joint_brier <- function(y, p) mean((y - p)^2)
+
+  joint_logloss <- function(y, p, eps=1e-15){
+    p <- pmin(pmax(p, eps), 1-eps)
+    -mean(y*log(p) + (1-y)*log(1-p))
+  }
+
+  joint_score_all <- function(y, p){
+    out <- c(
+      brier = joint_brier(y, p),
+      logloss = joint_logloss(y, p),
+      auc = NA_real_
+    )
+    if (length(unique(y)) >= 2) {
+      out["auc"] <- as.numeric(pROC::auc(pROC::roc(y, p, quiet = TRUE)))
+    }
+    out
+  }
+
+  joint_calibration_bins <- function(y, p, n_bins=10){
+    df <- data.frame(y=y, p=p) %>%
+      filter(!is.na(y), !is.na(p))
+
+    if (nrow(df) == 0) {
+      return(data.frame(n=integer(), p_mean=numeric(), obs=numeric(), lo=numeric(), hi=numeric()))
+    }
+
+    qs <- suppressWarnings(quantile(df$p, probs=seq(0,1,length.out=n_bins+1), na.rm=TRUE))
+    br <- unique(as.numeric(qs))
+
+    if (length(br) < 3) {
+      br <- unique(seq(min(df$p), max(df$p), length.out = min(n_bins+1, 6)))
+    }
+
+    if (length(br) < 2) {
+      dfc <- df %>%
+        summarise(
+          n = n(),
+          p_mean = mean(p),
+          obs = mean(y),
+          .groups="drop"
+        ) %>%
+        mutate(
+          se = sqrt(obs*(1-obs)/pmax(n,1)),
+          lo = pmax(obs - 1.96*se, 0),
+          hi = pmin(obs + 1.96*se, 1)
+        )
+      return(as.data.frame(dfc))
+    }
+
+    dfc <- df %>%
+      mutate(bin = cut(p, breaks = br, include.lowest = TRUE)) %>%
+      group_by(bin) %>%
+      summarise(
+        n = n(),
+        p_mean = mean(p),
+        obs = mean(y),
+        .groups="drop"
+      ) %>%
+      mutate(
+        se = sqrt(obs*(1-obs)/pmax(n,1)),
+        lo = pmax(obs - 1.96*se, 0),
+        hi = pmin(obs + 1.96*se, 1)
+      )
+
+    as.data.frame(dfc)
+  }
+
+  joint_plot_calibration <- function(y, p, title, n_bins=10){
+    df <- data.frame(y=y, p=p) %>% filter(!is.na(y), !is.na(p))
+    if (nrow(df) == 0) {
+      return(ggplot() + ggtitle(paste0(title, " (no data)")) + theme_minimal())
+    }
+    n_bins2 <- min(n_bins, max(3, floor(nrow(df)/50)))
+    bins <- joint_calibration_bins(df$y, df$p, n_bins=n_bins2)
+
+    ggplot(bins, aes(x=p_mean, y=obs)) +
+      geom_abline(slope=1, intercept=0, linetype=2) +
+      geom_point() +
+      geom_errorbar(aes(ymin=lo, ymax=hi), width=0) +
+      labs(x="Mean predicted probability", y="Observed frequency", title=title) +
+      theme_minimal()
+  }
+
+  joint_get_aic_bic <- function(model){
+    c(
+      AIC = AIC(model),
+      BIC = BIC(model),
+      logLik = as.numeric(logLik(model)),
+      edf = sum(model$edf),
+      n = nobs(model)
+    )
+  }
+
+  all_daily_joint <- bind_rows(
+    lapply(names(JOINT_STATIONS), function(st){
+      read_ecad_rr(JOINT_STATIONS[[st]], st)
+    })
+  )
+
+  nao_weekly <- read_excel(NAO_FILE) %>%
+    mutate(
+      DATE = as.Date(DATE),
+      iso_year = isoyear(DATE),
+      iso_week = isoweek(DATE),
+      nao = suppressWarnings(as.numeric(nao_index_cdas))
+    ) %>%
+    filter(!is.na(nao)) %>%
+    group_by(iso_year, iso_week) %>%
+    summarise(nao = mean(nao), .groups = "drop")
+
+  fit_joint_base <- function(train){
+    gam(exc_joint ~ s(time, k=20) + s(woy, bs="cc", k=15),
+        data=train, family=binomial(), method="REML",
+        knots=list(woy=c(0.5, 53.5)))
+  }
+
+  fit_joint_lag <- function(train){
+    gam(exc_joint ~ s(time, k=20) + s(woy, bs="cc", k=15) + lag1,
+        data=train, family=binomial(), method="REML",
+        knots=list(woy=c(0.5, 53.5)))
+  }
+
+  fit_joint_nao <- function(train){
+    gam(exc_joint ~ s(time, k=20) + s(woy, bs="cc", k=15) + nao,
+        data=train, family=binomial(), method="REML",
+        knots=list(woy=c(0.5, 53.5)))
+  }
+
+  fit_joint_lag_nao <- function(train){
+    gam(exc_joint ~ s(time, k=20) + s(woy, bs="cc", k=15) + lag1 + nao,
+        data=train, family=binomial(), method="REML",
+        knots=list(woy=c(0.5, 53.5)))
+  }
+
+  fit_joint_naoSeason <- function(train){
+    gam(exc_joint ~ s(time, k=20) +
+          s(woy, bs="cc", k=15) +
+          s(woy, by=nao, bs="cc", k=15),
+        data=train, family=binomial(), method="REML",
+        knots=list(woy=c(0.5, 53.5)))
+  }
+
+  fit_joint_lag_naoSeason <- function(train){
+    gam(exc_joint ~ s(time, k=20) +
+          s(woy, bs="cc", k=15) +
+          lag1 +
+          s(woy, by=nao, bs="cc", k=15),
+        data=train, family=binomial(), method="REML",
+        knots=list(woy=c(0.5, 53.5)))
+  }
+
+  make_weekly_joint <- function(daily, thresholds, joint_k){
+    daily_exc <- daily %>%
+      left_join(thresholds, by="station") %>%
+      mutate(exc = as.integer(rr_mm > thr))
+
+    daily_exc %>%
+      mutate(
+        week_id = floor_date(DATE, unit = "week", week_start = 1),
+        woy = isoweek(week_id),
+        iso_year = isoyear(week_id),
+        iso_week = isoweek(week_id)
+      ) %>%
+      group_by(week_id, station, iso_year, iso_week, woy) %>%
+      summarise(exc_station = as.integer(any(exc == 1)), .groups="drop") %>%
+      group_by(week_id, iso_year, iso_week, woy) %>%
+      summarise(
+        n_extreme = sum(exc_station),
+        exc_joint = as.integer(n_extreme >= joint_k),
+        .groups="drop"
+      ) %>%
+      arrange(week_id) %>%
+      mutate(
+        time = row_number(),
+        lag1 = dplyr::lag(exc_joint)
+      ) %>%
+      filter(!is.na(lag1))
+  }
+
+  run_joint_split <- function(daily, split){
+    train_daily <- daily %>% filter(DATE <= as.Date(split$train_end))
+    test_daily  <- daily %>% filter(DATE >= as.Date(split$test_start),
+                                   DATE <= as.Date(split$test_end))
+
+    thresholds <- train_daily %>%
+      filter(rr_mm > wet_day_mm) %>%
+      group_by(station) %>%
+      summarise(
+        thr = quantile(rr_mm, probs=JOINT_P_EXTREME, type=8, na.rm=TRUE),
+        .groups="drop"
+      )
+
+    weekly_all <- make_weekly_joint(daily, thresholds, JOINT_K) %>%
+      left_join(nao_weekly, by = c("iso_year","iso_week")) %>%
+      arrange(week_id)
+
+    train <- weekly_all %>% filter(week_id <= as.Date(split$train_end))
+    test  <- weekly_all %>% filter(week_id >= as.Date(split$test_start),
+                                   week_id <= as.Date(split$test_end))
+
+    train_nao <- train %>% filter(!is.na(nao))
+    test_nao  <- test  %>% filter(!is.na(nao))
+
+    if (nrow(test_nao) == 0) {
+      p_clim <- mean(train$exc_joint)
+
+      m_base <- fit_joint_base(train)
+      p_base <- predict(m_base, test, type="response")
+
+      m_lag  <- fit_joint_lag(train)
+      p_lag  <- predict(m_lag, test, type="response")
+
+      s_clim <- joint_score_all(test$exc_joint, rep(p_clim, nrow(test)))
+      s_base <- joint_score_all(test$exc_joint, p_base)
+      s_lag  <- joint_score_all(test$exc_joint, p_lag)
+
+      scores <- data.frame(
+        train_end = split$train_end,
+        test_start = split$test_start,
+        test_end = split$test_end,
+        thr_mean = mean(thresholds$thr, na.rm = TRUE),
+        model = c("climatology","base","base+lag","base+nao","base+lag+nao","base+naoSeason","base+lag+naoSeason"),
+        brier   = c(s_clim["brier"], s_base["brier"], s_lag["brier"], rep(NA_real_, 4)),
+        logloss = c(s_clim["logloss"], s_base["logloss"], s_lag["logloss"], rep(NA_real_, 4)),
+        auc     = c(s_clim["auc"], s_base["auc"], s_lag["auc"], rep(NA_real_, 4))
+      )
+
+      diagnostics <- data.frame(
+        train_end = split$train_end,
+        test_start = split$test_start,
+        test_end = split$test_end,
+        model = c("base","base+lag"),
+        rbind(joint_get_aic_bic(m_base), joint_get_aic_bic(m_lag))
+      )
+
+      pred_long <- tibble()
+      return(list(scores=scores, diagnostics=diagnostics, pred_long=pred_long))
+    }
+
+    nao_mu <- mean(train_nao$nao)
+    nao_sd <- sd(train_nao$nao)
+    if (is.na(nao_sd) || nao_sd == 0) nao_sd <- 1
+    train_nao <- train_nao %>% mutate(nao = (nao - nao_mu)/nao_sd)
+    test_nao  <- test_nao  %>% mutate(nao = (nao - nao_mu)/nao_sd)
+
+    eval <- test_nao
+
+    p_clim <- mean(train$exc_joint)
+    p_clim_eval <- rep(p_clim, nrow(eval))
+
+    m_base <- fit_joint_base(train)
+    p_base_eval <- predict(m_base, eval, type="response")
+
+    m_lag <- fit_joint_lag(train)
+    p_lag_eval <- predict(m_lag, eval, type="response")
+
+    if (nrow(train_nao) < 50 || sum(train_nao$exc_joint) < 5) {
+      m_nao <- m_naoS <- NULL
+      m_lagnao <- m_lagnaoS <- NULL
+      p_nao <- p_naoS <- rep(NA_real_, nrow(eval))
+      p_lagnao <- p_lagnaoS <- rep(NA_real_, nrow(eval))
+    } else {
+      m_nao <- fit_joint_nao(train_nao)
+      p_nao <- predict(m_nao, eval, type="response")
+
+      m_lagnao <- fit_joint_lag_nao(train_nao)
+      p_lagnao <- predict(m_lagnao, eval, type="response")
+
+      m_naoS <- fit_joint_naoSeason(train_nao)
+      p_naoS <- predict(m_naoS, eval, type="response")
+
+      m_lagnaoS <- fit_joint_lag_naoSeason(train_nao)
+      p_lagnaoS <- predict(m_lagnaoS, eval, type="response")
+    }
+
+    s_clim <- joint_score_all(eval$exc_joint, p_clim_eval)
+    s_base <- joint_score_all(eval$exc_joint, p_base_eval)
+    s_lag  <- joint_score_all(eval$exc_joint, p_lag_eval)
+    s_nao  <- joint_score_all(eval$exc_joint, p_nao)
+    s_lagnao <- joint_score_all(eval$exc_joint, p_lagnao)
+    s_naoS <- joint_score_all(eval$exc_joint, p_naoS)
+    s_lagnaoS <- joint_score_all(eval$exc_joint, p_lagnaoS)
+
+    scores <- data.frame(
+      train_end = split$train_end,
+      test_start = split$test_start,
+      test_end = split$test_end,
+      thr_mean = mean(thresholds$thr, na.rm = TRUE),
+      model = c("climatology","base","base+lag","base+nao","base+lag+nao","base+naoSeason","base+lag+naoSeason"),
+      brier   = c(s_clim["brier"], s_base["brier"], s_lag["brier"], s_nao["brier"], s_lagnao["brier"], s_naoS["brier"], s_lagnaoS["brier"]),
+      logloss = c(s_clim["logloss"], s_base["logloss"], s_lag["logloss"], s_nao["logloss"], s_lagnao["logloss"], s_naoS["logloss"], s_lagnaoS["logloss"]),
+      auc     = c(s_clim["auc"], s_base["auc"], s_lag["auc"], s_nao["auc"], s_lagnao["auc"], s_naoS["auc"], s_lagnaoS["auc"])
+    )
+
+    diag_list <- list(
+      `base` = m_base,
+      `base+lag` = m_lag
+    )
+    if (!is.null(m_nao)) {
+      diag_list <- c(diag_list, list(
+        `base+nao` = m_nao,
+        `base+naoSeason` = m_naoS,
+        `base+lag+nao` = m_lagnao,
+        `base+lag+naoSeason` = m_lagnaoS
+      ))
+    }
+
+    diagnostics <- bind_rows(lapply(names(diag_list), function(mname){
+      mod <- diag_list[[mname]]
+      out <- as.data.frame(as.list(joint_get_aic_bic(mod)))
+      out$model <- mname
+      out
+    })) %>%
+      mutate(
+        train_end = split$train_end,
+        test_start = split$test_start,
+        test_end = split$test_end
+      ) %>%
+      select(train_end, test_start, test_end, model, AIC, BIC, logLik, edf, n)
+
+    pred_long <- bind_rows(
+      tibble(fold=NA_integer_, model="climatology", y=eval$exc_joint, p=p_clim_eval),
+      tibble(fold=NA_integer_, model="base", y=eval$exc_joint, p=p_base_eval),
+      tibble(fold=NA_integer_, model="base+nao", y=eval$exc_joint, p=p_nao),
+      tibble(fold=NA_integer_, model="base+naoSeason", y=eval$exc_joint, p=p_naoS),
+      tibble(fold=NA_integer_, model="base+lag", y=eval$exc_joint, p=p_lag_eval),
+      tibble(fold=NA_integer_, model="base+lag+nao", y=eval$exc_joint, p=p_lagnao),
+      tibble(fold=NA_integer_, model="base+lag+naoSeason", y=eval$exc_joint, p=p_lagnaoS)
+    ) %>% filter(!is.na(p))
+
+    list(scores=scores, diagnostics=diagnostics, pred_long=pred_long)
+  }
+
+  joint_scores <- list()
+  joint_diagnostics <- list()
+  joint_preds <- list()
+
+  for (i in seq_along(JOINT_SPLITS)) {
+    sp <- JOINT_SPLITS[[i]]
+
+    res <- run_joint_split(all_daily_joint, sp)
+
+    scores_i <- res$scores %>% mutate(fold = i)
+    diagnostics_i <- res$diagnostics %>% mutate(fold = i)
+
+    print(scores_i)
+
+    joint_scores[[length(joint_scores) + 1]] <- scores_i
+    joint_diagnostics[[length(joint_diagnostics) + 1]] <- diagnostics_i
+
+    if (nrow(res$pred_long) > 0) {
+      joint_preds[[length(joint_preds) + 1]] <- res$pred_long %>% mutate(fold = i)
+    }
+
+    if (JOINT_SAVE_PLOTS && i == JOINT_PLOT_FOLD_TO_SAVE && nrow(res$pred_long) > 0) {
+      fold_dir <- file.path(JOINT_OUT_DIR, paste0("calibration_fold", i))
+      dir.create(fold_dir, showWarnings = FALSE)
+
+      fold_preds <- res$pred_long %>% mutate(fold=i)
+
+      for (mname in sort(unique(fold_preds$model))) {
+        dfm <- fold_preds %>% filter(model == mname)
+        if (nrow(dfm) == 0) next
+
+        g <- joint_plot_calibration(
+          y = dfm$y,
+          p = dfm$p,
+          title = paste0("Joint weekly ", mname, " calibration (fold ", i, ")")
+        )
+
+        ggsave(
+          filename = file.path(fold_dir, paste0("cal_joint_fold", i, "_", gsub("\\+","_", mname), ".png")),
+          plot = g, width = 6, height = 4, dpi = 200
+        )
+      }
+    }
+  }
+
+  joint_scores_df <- bind_rows(joint_scores)
+  joint_diagnostics_df <- bind_rows(joint_diagnostics)
+  joint_preds_df <- bind_rows(joint_preds)
+
+  write.csv(joint_scores_df,       file.path(JOINT_OUT_DIR, "scores_joint_weekly.csv"), row.names = FALSE)
+  write.csv(joint_diagnostics_df,  file.path(JOINT_OUT_DIR, "diagnostics_aic_bic_joint_weekly.csv"), row.names = FALSE)
+
+  cat("\nDONE.\nSaved joint weekly outputs in:", JOINT_OUT_DIR, "\n")
+
+  if (JOINT_SAVE_PLOTS && exists("joint_preds_df") && nrow(joint_preds_df) > 0) {
+    pooled_dir <- file.path(JOINT_OUT_DIR, "calibration_pooled_allfolds")
+    dir.create(pooled_dir, showWarnings = FALSE)
+
+    for (mname in sort(unique(joint_preds_df$model))) {
+      dfm <- joint_preds_df %>% filter(model == mname)
+      if (nrow(dfm) == 0) next
+
+      g <- joint_plot_calibration(
+        y = dfm$y,
+        p = dfm$p,
+        title = paste0("Joint weekly ", mname, " calibration (POOLED folds)")
+      )
+
+      ggsave(
+        filename = file.path(pooled_dir, paste0("cal_pooled_joint_", gsub("\\+","_", mname), ".png")),
+        plot = g, width = 6, height = 4, dpi = 200
+      )
+    }
+
+    cat("\nSaved pooled calibration plots in:\n", pooled_dir, "\n")
+  }
+
+  joint_summary_mean <- joint_scores_df %>%
+    group_by(model) %>%
+    summarise(
+      mean_brier   = mean(brier, na.rm = TRUE),
+      mean_logloss = mean(logloss, na.rm = TRUE),
+      mean_auc     = mean(auc, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  write.csv(joint_summary_mean,
+            file = file.path(JOINT_OUT_DIR, "summary_mean_scores_joint_weekly.csv"),
+            row.names = FALSE)
+
+  joint_ranked_overall <- joint_summary_mean %>%
+    mutate(
+      rank_logloss = rank(mean_logloss, ties.method = "average"),
+      rank_brier   = rank(mean_brier,   ties.method = "average"),
+      rank_auc     = rank(-mean_auc,    ties.method = "average"),
+      rank_total   = (rank_logloss + rank_brier + rank_auc) / 3
+    ) %>%
+    arrange(rank_total)
+
+  write.csv(joint_ranked_overall,
+            file.path(JOINT_OUT_DIR, "ranking_overall_models_joint_weekly.csv"),
+            row.names = FALSE)
+
+  if (nrow(joint_diagnostics_df) > 0) {
+    joint_diag_summary <- joint_diagnostics_df %>%
+      group_by(model) %>%
+      summarise(
+        mean_AIC = mean(AIC, na.rm=TRUE),
+        mean_BIC = mean(BIC, na.rm=TRUE),
+        mean_logLik = mean(logLik, na.rm=TRUE),
+        mean_edf = mean(edf, na.rm=TRUE),
+        .groups="drop"
+      ) %>%
+      arrange(mean_AIC)
+
+    write.csv(joint_diag_summary,
+              file.path(JOINT_OUT_DIR, "diagnostics_mean_aic_bic_joint_weekly.csv"),
+              row.names = FALSE)
+
+    cat("\nSaved diagnostics summary to:\n",
+        file.path(JOINT_OUT_DIR, "diagnostics_mean_aic_bic_joint_weekly.csv"),
+        "\n")
+  }
 }
