@@ -14,7 +14,12 @@ library(lubridate)
 library(mgcv)
 library(ggplot2)
 
-setwd("C:/Users/Sara/Downloads/Case study")
+station_name <- "Alicante"
+
+script_dir <- tryCatch(dirname(normalizePath(sys.frame(1)$ofile)), error = function(e) NA)
+if (!is.na(script_dir) && nzchar(script_dir)) {
+  setwd(script_dir)
+}
 
 # read individual station + filter on date
 read_ecad_rr <- function(path, station_name = "alicante",
@@ -38,7 +43,7 @@ read_ecad_rr <- function(path, station_name = "alicante",
     select(DATE, station, rr_mm)
 }
 
-df <- read_ecad_rr("alicante.xlsx", "Alicante")
+df <- read_ecad_rr("alicante.xlsx", station_name)
 
 cat("Rows:", nrow(df), "\n")
 cat("Date range:", format(min(df$DATE)), "to", format(max(df$DATE)), "\n")
@@ -81,7 +86,7 @@ par(mar = c(4, 4, 2, 1))
 gam.check(m_indiv)
 dev.off()
 
-# plot time trend using gam keeping seasonality fixed
+# plot time trend using baseline GAM keeping seasonality fixed
 nd_time <- data.frame(
   time = seq(min(df$time), max(df$time), length.out = 800),
   doy  = 180
@@ -99,14 +104,14 @@ ggplot(nd_time, aes(x = date, y = p)) +
   labs(
     x = NULL,
     y = "P(exceedance)",
-    title = paste0("Alicante: exceedance probability over time (doy fixed at 180)\n",
+    title = paste0(station_name, " — baseline GAM: time trend (doy fixed at 180)\n",
                    "threshold=", round(thr, 1), " mm, p=", p_extreme)
   ) +
   theme_minimal() -> p_time
 
 print(p_time)
 
-# plot seasonality holding time fixed
+# plot seasonality holding time fixed (baseline GAM)
 nd_season <- data.frame(
   doy  = 1:366,
   time = median(df$time)
@@ -124,7 +129,7 @@ ggplot(nd_season, aes(x = doy, y = p)) +
   labs(
     x = "Day of year",
     y = "P(exceedance)",
-    title = paste0("Seasonal exceedance probability (time fixed)\n",
+    title = paste0(station_name, " — baseline GAM: seasonal pattern (time fixed)\n",
                    "threshold=", round(thr, 1), " mm, p=", p_extreme)
   ) +
   theme_minimal() -> p_season
@@ -160,7 +165,7 @@ par(mar = c(4, 4, 2, 1))
 gam.check(m_lag)
 dev.off()
 
-# plot time using gam with lag
+# plot time using GAM with lag
 nd_time <- data.frame(
   time = seq(min(df_lag$time), max(df_lag$time), length.out = 800),
   doy  = 180,
@@ -179,14 +184,14 @@ p_time <- ggplot(nd_time, aes(x = date, y = p)) +
   labs(
     x = NULL,
     y = "P(exceedance)",
-    title = paste0(station_name, ": time trend (season fixed at doy=180, lag1=0)\n",
+    title = paste0(station_name, " — GAM + lag1: time trend (doy=180, lag1=0)\n",
                    "thr=", round(thr, 1), " mm (p=", p_extreme, ")")
   ) +
   theme_minimal()
 
 print(p_time)
 
-# plot seasonality using gam with lag
+# plot seasonality using GAM with lag
 nd_season <- data.frame(
   doy  = 1:366,
   time = median(df_lag$time),
@@ -205,7 +210,7 @@ p_season <- ggplot(nd_season, aes(x = doy, y = p)) +
   labs(
     x = "Day of year",
     y = "P(exceedance)",
-    title = paste0(station_name, ": seasonal pattern (time fixed, lag1=0)\n",
+    title = paste0(station_name, " — GAM + lag1: seasonal pattern (time fixed, lag1=0)\n",
                    "thr=", round(thr, 1), " mm (p=", p_extreme, ")")
   ) +
   theme_minimal()
@@ -248,6 +253,63 @@ gam.check(m_lag_nao)
 cat("Lag OR:", round(exp(coef(m_lag_nao)["lag1"]), 2), "\n")
 cat("NAO OR:", round(exp(coef(m_lag_nao)["nao"]), 2), "\n")
 
+# plot time using GAM with lag + NAO (NAO fixed to 0)
+nd_time <- data.frame(
+  time = seq(min(df_lag_nao$time), max(df_lag_nao$time), length.out = 800),
+  doy  = 180,
+  lag1 = 0,
+  nao  = 0
+)
+
+pred_t <- predict(m_lag_nao, newdata = nd_time, type = "link", se.fit = TRUE)
+nd_time$p  <- plogis(pred_t$fit)
+nd_time$lo <- plogis(pred_t$fit - 1.96 * pred_t$se.fit)
+nd_time$hi <- plogis(pred_t$fit + 1.96 * pred_t$se.fit)
+nd_time$date <- min(df_lag_nao$DATE) + round(nd_time$time)
+
+p_time <- ggplot(nd_time, aes(x = date, y = p)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.25) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = NULL,
+    y = "P(exceedance)",
+    title = paste0(station_name,
+                   " — GAM + lag1 + NAO: time trend (doy=180, lag1=0, nao=0)\n",
+                   "thr=", round(thr, 1), " mm (p=", p_extreme, ")")
+  ) +
+  theme_minimal()
+
+print(p_time)
+
+# plot seasonality using GAM with lag + NAO (NAO fixed to 0)
+nd_season <- data.frame(
+  doy  = 1:366,
+  time = median(df_lag_nao$time),
+  lag1 = 0,
+  nao  = 0
+)
+
+pred_s <- predict(m_lag_nao, newdata = nd_season, type = "link", se.fit = TRUE)
+nd_season$p  <- plogis(pred_s$fit)
+nd_season$lo <- plogis(pred_s$fit - 1.96 * pred_s$se.fit)
+nd_season$hi <- plogis(pred_s$fit + 1.96 * pred_s$se.fit)
+
+p_season <- ggplot(nd_season, aes(x = doy, y = p)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.25) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = seq(1, 366, by = 30)) +
+  labs(
+    x = "Day of year",
+    y = "P(exceedance)",
+    title = paste0(
+      station_name,
+      " — GAM + lag1 + NAO: seasonal pattern (time fixed, lag1=0, nao=0)\n",
+      "thr=", round(thr, 1), " mm (p=", p_extreme, ")"
+    )
+  ) +
+  theme_minimal()
+
+print(p_season)
 
 
 
