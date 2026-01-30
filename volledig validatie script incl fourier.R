@@ -1000,27 +1000,11 @@ if (RUN_3FOLD_CV) {
     df_lagnao <- preds_df %>%
       filter(model == "lag_nao_REML")
     
-    bins_pooled <- calibration_bins(df_lagnao$y, df_lagnao$p, n_bins=CALIBRATION_BINS)
-    max_x <- max(bins_pooled$p_mean, na.rm=TRUE)
-    max_y <- max(bins_pooled$hi, na.rm=TRUE)
-    pad_x <- ifelse(is.finite(max_x), max_x * 0.15, 0)
-    pad_y <- ifelse(is.finite(max_y), max_y * 0.15, 0)
-    
-    g_pooled <- ggplot(bins_pooled, aes(x=p_mean, y=obs)) +
-      geom_abline(slope=1, intercept=0, linetype=2) +
-      geom_point() +
-      geom_errorbar(aes(ymin=lo, ymax=hi), width=0) +
-      labs(x="Mean predicted probability", y="Observed frequency",
-           title=paste0(STATION_NAME, " — lag+NAO calibration (pooled CV, NAO subset)")) +
-      coord_cartesian(
-        xlim=c(0, max_x + pad_x),
-        ylim=c(0, max_y + pad_y)
-      ) +
-      theme_minimal()
-    
-    ggsave(
-      file.path(OUT_DIR, "calibration_lag_nao_pooled_nao_subset.png"),
-      g_pooled, width=7, height=5, dpi=200
+    plot_calibration_zoom(
+      y = df_lagnao$y,
+      p = df_lagnao$p,
+      title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
+      out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
     )
   }
 } else {
