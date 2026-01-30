@@ -704,6 +704,18 @@ p_base_overlay <- ggplot(curves_base, aes(x=date, y=fit, linetype=which)) +
 ggsave(file.path(OUT_DIR, "overlay_base_REML_vs_GCV.png"),
        p_base_overlay, width=10, height=5, dpi=150)
 
+curves_base_ci <- curves_base %>%
+  mutate(ribbon_group = which)
+
+p_base_overlay_ci <- ggplot(curves_base_ci, aes(x=date, y=fit, linetype=which)) +
+  geom_ribbon(aes(ymin=lo, ymax=hi, fill=ribbon_group), alpha=0.12, color=NA) +
+  geom_line(linewidth=1) +
+  labs(x=NULL, y="P(exceedance)",
+       title=paste0(STATION_NAME, " — Baseline: REML vs GCV (doy=180, CI)")) +
+  theme_minimal()
+ggsave(file.path(OUT_DIR, "overlay_base_REML_vs_GCV_CI.png"),
+       p_base_overlay_ci, width=10, height=5, dpi=150)
+
 curve_gam <- make_curve_ci(m_lag_nao_reml, df_ref, label="Lag+NAO GAM (REML)")
 curve_bam <- make_curve_ci(m_lag_nao_bam,  df_ref, label=paste0("Lag+NAO BAM AR1 rho=", round(rho_hat,3)))
 curves_gb <- bind_rows(curve_gam, curve_bam)
