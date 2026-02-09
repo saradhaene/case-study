@@ -699,48 +699,6 @@ writeLines(
 cat("\nDONE. All outputs in:\n", OUT_DIR, "\n")
 
 
-# gam check
-library(mgcv)
-
-m_lowk <- gam(
-  exc ~ s(time, k = 15) + s(doy, bs = "cc", k = 10),
-  family = binomial(link = "logit"),
-  data = train0,
-  method = "REML",
-  knots = KNOTS_DOY
-)
-
-png(file.path(OUT_DIR, "gamcheck_lowk.png"), width = 1600, height = 1100, res = 150)
-gam.check(m_lowk)
-dev.off()
-
-k.check(m_lowk)
-
-m_highk <- gam(
-  exc ~ s(time, k = t_base$final_k$k_time) + s(doy, bs = "cc", k = t_base$final_k$k_doy),
-  family = binomial(link = "logit"),
-  data = train0,
-  method = "REML",
-  knots = KNOTS_DOY
-)
-
-png(file.path(OUT_DIR, "gamcheck_highk.png"), width = 1600, height = 1100, res = 150)
-gam.check(m_highk)
-dev.off()
-
-k.check(m_highk)
-
-
-gam.check(m_lag_reml)
-k.check(m_lag_reml)
-
-gam.check(m_lag_nao_reml)
-k.check(m_lag_nao_reml)
-
-
-
-
-# 3 folds
 # ============================================================
 # 14) 3-FOLD TIME-BLOCKED CV (same specs) — scores + optional calibration
 # ============================================================
@@ -754,6 +712,7 @@ FOLDS <- list(
        test_start=as.Date("2011-01-01"), test_end=as.Date("2020-12-31"))
 )
 
+RUN_3FOLD_CV <- FALSE            # zet TRUE als je de langzame 3-fold CV wilt draaien
 SAVE_FOLD_CALIBRATION <- TRUE     # zet FALSE als je geen extra plots wilt
 CALIBRATION_BINS <- 10
 CAL_X_MAX <- 0.015                # zoom x-as (anders wordt alles smal)
@@ -828,8 +787,10 @@ score_df <- function(model_name, fold_name, thr, y, p) {
 }
 
 cv_scores <- list()
+cv_preds <- list()
 
-for (sp in FOLDS) {
+if (RUN_3FOLD_CV) {
+  for (sp in FOLDS) {
   
   cat("\n--- Running", sp$name, "train_end =", as.character(sp$train_end),
       "test =", as.character(sp$test_start), "to", as.character(sp$test_end), "\n")
@@ -922,61 +883,54 @@ for (sp in FOLDS) {
                             out_png=file.path(cal_dir, "cal_int_REML.png"))
     }
     
+    cv_preds[[length(cv_preds)+1]] <- data.frame(
+      fold = sp$name,
+      model = "lag_nao_REML",
+      y = test_nao_l$exc,
+      p = p_lagnao
+    )
+    
   } else {
     cat("  (Skipping NAO models in", sp$name, "- insufficient NAO overlap or too few events.)\n")
   }
+  }
+  
+  cv_table <- bind_rows(cv_scores)
+  
+  write.csv(cv_table, file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), row.names=FALSE)
+  cat("\nSaved 3-fold CV scores to:", file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), "\n")
+  
+  # ---- mean over folds per model (overall) ----
+  cv_mean <- cv_table %>%
+    group_by(model) %>%
+    summarise(
+      mean_logloss = mean(logloss, na.rm=TRUE),
+      mean_brier   = mean(brier, na.rm=TRUE),
+      mean_auc     = mean(auc, na.rm=TRUE),
+      n_folds      = n_distinct(fold),
+      .groups="drop"
+    ) %>%
+    arrange(mean_logloss, mean_brier, desc(mean_auc))
+  
+  write.csv(cv_mean, file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), row.names=FALSE)
+  cat("Saved 3-fold mean scores to:", file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), "\n")
+  
+  print(cv_mean)
+  
+  preds_df <- dplyr::bind_rows(cv_preds)
+  
+  if (nrow(preds_df) > 0) {
+    df_lagnao <- preds_df %>%
+      filter(model == "lag_nao_REML")
+    
+    plot_calibration_zoom(
+      y = df_lagnao$y,
+      p = df_lagnao$p,
+      title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
+      out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
+    )
+  }
+} else {
+  cat("\nSkipping 3-fold CV. Set RUN_3FOLD_CV <- TRUE to enable.\n")
 }
-
-cv_table <- bind_rows(cv_scores)
-
-write.csv(cv_table, file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), row.names=FALSE)
-cat("\nSaved 3-fold CV scores to:", file.path(OUT_DIR, "cv3fold_scores_Alicante.csv"), "\n")
-
-# ---- mean over folds per model (overall) ----
-cv_mean <- cv_table %>%
-  group_by(model) %>%
-  summarise(
-    mean_logloss = mean(logloss, na.rm=TRUE),
-    mean_brier   = mean(brier, na.rm=TRUE),
-    mean_auc     = mean(auc, na.rm=TRUE),
-    n_folds      = n_distinct(fold),
-    .groups="drop"
-  ) %>%
-  arrange(mean_logloss, mean_brier, desc(mean_auc))
-
-write.csv(cv_mean, file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), row.names=FALSE)
-cat("Saved 3-fold mean scores to:", file.path(OUT_DIR, "cv3fold_mean_scores_Alicante.csv"), "\n")
-
-print(cv_mean)
-
-
-data.frame(
-  fold = sp$name,
-  model = "lag_nao_REML",
-  y = test_nao_l$exc,
-  p = p_lagnao
-)
-
-cv_preds <- list()
-
-cv_preds[[length(cv_preds)+1]] <- data.frame(
-  fold = sp$name,
-  model = "lag_nao_REML",
-  y = test_nao_l$exc,
-  p = p_lagnao
-)
-
-preds_df <- dplyr::bind_rows(cv_preds)
-
-df_lagnao <- preds_df %>%
-  filter(model == "lag_nao_REML")
-
-plot_calibration_zoom(
-  y = df_lagnao$y,
-  p = df_lagnao$p,
-  title = paste0(STATION_NAME, " — lag+NAO calibration (pooled CV)"),
-  out_png = file.path(OUT_DIR, "calibration_lag_nao_pooled.png")
-)
-
-
 
